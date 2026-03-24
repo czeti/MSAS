@@ -6,7 +6,7 @@
 
 ---
 
-> This is a **personal learning and concept project**, it is not a production-grade security tool. It was built to explore the intersection of modern Rust development and z/OS internals, Nothing here should be taken as a definitive reference for mainframe security auditing, and the compliance mappings are illustrative rather than authoritative. If you're auditing a real production mainframe, please use proper tooling and talk to people who know what they're doing.
+> This is a **personal learning and concept project**, it is not a production-grade security tool. It was built to explore the intersection of modern Rust development and z/OS internals, Nothing here should be taken as a definitive reference for mainframe security auditing, the compliance mappings are illustrative rather than authoritative. If you're auditing a real production mainframe, please use proper tooling and talk to people who know what they're doing.
 > 
 > That said, if you're also poking around old mainframe tech for fun, welcome, and thank you for your reading.
 
