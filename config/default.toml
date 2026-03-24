@@ -1,0 +1,9 @@
+[mainframe]
+host = "192.168.8.210"
+user = "IBMUSER"
+pass = "SYS1"
+
+[paths]
+rexx_pds = "IBMUSER.PROBES.REXX"
+output_dsn = "IBMUSER.MSAS.OUTPUT"
+local_output = "/tmp/test_output.txt" # assumes linux fs, user would have to change

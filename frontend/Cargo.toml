@@ -1,0 +1,11 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[workspace]
+members = ["msas_cli",
+    "msas_core"
+, "msas_reporting", "msas_scanners"]

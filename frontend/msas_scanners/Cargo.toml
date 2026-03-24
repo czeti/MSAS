@@ -1,0 +1,7 @@
+[package]
+name = "msas_scanners"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+msas_core = { version = "0.1.0", path = "../msas_core" }
