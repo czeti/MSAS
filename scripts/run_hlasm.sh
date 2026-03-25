@@ -1,263 +1,259 @@
-#!/usr/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
+# --- Config ---
 HOST="${MF_HOST:-192.168.8.210}"
 USER="${MF_USER:-IBMUSER}"
 PASS="${MF_PASS:-SYS1}"
+
 ASM_PDS="${ASM_PDS:-IBMUSER.PROBES.ASM}"
-OUTPUT_DSN_BASE="${OUTPUT_DSN:-IBMUSER.MSAS.OUTPUT}"
-LOCAL_OUTPUT="${LOCAL_OUTPUT:-/tmp/test_output/hlasm_output.txt}"
-LOCAL_LISTING="${LOCAL_LISTING:-/tmp/test_output/hlasm_listing.txt}"
+OUT_BASE="${OUTPUT_DSN:-IBMUSER.MSAS.OUTPUT}"
 
-PROBE_NAME="${1:-apf_check}"
+LOCAL_TXT="${LOCAL_OUTPUT:-/tmp/test_output/hlasm_output.txt}"
+LOCAL_LST="${LOCAL_LISTING:-/tmp/test_output/hlasm_listing.txt}"
 
-MEMBER=$(echo "$PROBE_NAME" \
+PROBE="${1:-apf_check}"
+
+# --- Member name sanitisation ---
+MEMBER=$(printf "%s" "$PROBE" \
   | tr '[:lower:]' '[:upper:]' \
   | tr -d '_-' \
   | cut -c1-8)
 
-PID_SUFFIX=$(printf '%05d' $(( $$ % 99999 )))
-OUTPUT_DSN="${OUTPUT_DSN_BASE}.${MEMBER}.P${PID_SUFFIX}"
-LISTING_DSN="${OUTPUT_DSN_BASE}.${MEMBER}.P${PID_SUFFIX}L"
+PID_TAG=$(printf '%05d' $(( $$ % 99999 )))
 
-PROBE_LOCAL="probes/hlasm/${PROBE_NAME}.asm"
-JCL_TEMPLATE="probes/jcl/RUN_HLASM.jcl"
-OUTPUT_DIR="$(dirname "$LOCAL_OUTPUT")"
-TMP_JCL="/tmp/run_hlasm_$$.jcl"
-TMP_JCL_SUBST="/tmp/run_hlasm_subst_$$.jcl"
-LOCAL_OUTPUT_BIN="${LOCAL_OUTPUT%.txt}_raw.bin"
-LOCAL_OUTPUT_HEX="${LOCAL_OUTPUT%.txt}_hex.txt"
+OUT_DSN="${OUT_BASE}.${MEMBER}.P${PID_TAG}"
+LST_DSN="${OUT_BASE}.${MEMBER}.P${PID_TAG}L"
 
-mkdir -p "$OUTPUT_DIR"
-trap 'rm -f "$TMP_JCL" "$TMP_JCL_SUBST"' EXIT
+SRC_FILE="probes/hlasm/${PROBE}.asm"
+JCL_SRC="probes/jcl/RUN_HLASM.jcl"
 
-cp "$JCL_TEMPLATE" "$TMP_JCL"
+OUT_DIR="$(dirname "$LOCAL_TXT")"
+
+TMP_JCL="/tmp/jcl_${$}.tmp"
+TMP_JCL_FILLED="/tmp/jcl_${$}.final"
+
+BIN_OUT="${LOCAL_TXT%.txt}_raw.bin"
+HEX_OUT="${LOCAL_TXT%.txt}_hex.txt"
+
+mkdir -p "$OUT_DIR"
+trap 'rm -f "$TMP_JCL" "$TMP_JCL_FILLED"' EXIT
+
+# --- Prepare JCL ---
+cp "$JCL_SRC" "$TMP_JCL"
 
 sed \
   -e "s/%MEMBER%/${MEMBER}/g" \
-  -e "s/%OUTPUT_DSN%/${OUTPUT_DSN}/g" \
-  -e "s/%LISTING_DSN%/${LISTING_DSN}/g" \
-  "$TMP_JCL" > "$TMP_JCL_SUBST"
+  -e "s/%OUTPUT_DSN%/${OUT_DSN}/g" \
+  -e "s/%LISTING_DSN%/${LST_DSN}/g" \
+  "$TMP_JCL" > "$TMP_JCL_FILLED"
 
-upload_succeeded() { echo "$1" | grep -qi "Transfer completed"; }
-
-ftp_get_ascii() {
-  ftp -inv "$HOST" 2>&1 <<FTPEOF || true
+# --- FTP helpers ---
+ftp_ascii() {
+  ftp -inv "$HOST" <<EOF 2>&1 || true
 user $USER $PASS
 quote TYPE A
 get "'$1'" "$2"
 bye
-FTPEOF
+EOF
 }
 
-ftp_get_binary() {
-  ftp -inv "$HOST" 2>&1 <<FTPEOF || true
+ftp_binary() {
+  ftp -inv "$HOST" <<EOF 2>&1 || true
 user $USER $PASS
 quote TYPE I
 get "'$1'" "$2"
 bye
-FTPEOF
+EOF
 }
 
-ftp_delete_dataset() {
-  ftp -inv "$HOST" 2>&1 <<FTPEOF || true
+ftp_remove() {
+  ftp -inv "$HOST" <<EOF 2>&1 || true
 user $USER $PASS
 quote site filetype=seq
 delete "'$1'"
 bye
-FTPEOF
+EOF
 }
 
-# Decode raw RECFM=FB EBCDIC binary from the mainframe
-#
-# note for future me: The output dataset is RECFM=FB LRECL=133, written by the
-# HLASM probe as pure EBCDIC (cp037). binary FTP transfer gives me the raw
-# bytes
-decode_ebcdic_output() {
-  local bin_file="$1"
-  local hex_file="$2"
-  local lrecl="${3:-133}"
-  python3 - "$bin_file" "$hex_file" "$lrecl" <<'PYEOF'
+upload_ok() {
+  grep -qi "Transfer completed" <<<"$1"
+}
+
+# --- EBCDIC decode ---
+decode_data() {
+  local in_bin="$1"
+  local out_hex="$2"
+  local rec_len="${3:-133}"
+
+  python3 - "$in_bin" "$out_hex" "$rec_len" <<'PY'
 import sys, pathlib, unicodedata
 
-data   = pathlib.Path(sys.argv[1]).read_bytes()
-hexout = sys.argv[2]
-lrecl  = int(sys.argv[3])
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+hex_file = sys.argv[2]
+lrecl = int(sys.argv[3])
 
-# Valid EBCDIC bytes for dataset name chars (A-Z 0-9 @ # $ - . space)
-VALID_DSN_EBCDIC = (
-    set(range(0xC1, 0xCA)) |   # A-I
-    set(range(0xD1, 0xDA)) |   # J-R
-    set(range(0xE2, 0xEA)) |   # S-Z
-    set(range(0xF0, 0xFA)) |   # 0-9
-    {0x40, 0x4B, 0x5B, 0x60, 0x7B, 0x7C}  # space . $ - # @
+VALID = (
+    set(range(0xC1, 0xCA)) |
+    set(range(0xD1, 0xDA)) |
+    set(range(0xE2, 0xEA)) |
+    set(range(0xF0, 0xFA)) |
+    {0x40, 0x4B, 0x5B, 0x60, 0x7B, 0x7C}
 )
 
-if len(data) % lrecl != 0:
-    print(f"WARNING: file size {len(data)} is not a multiple of LRECL={lrecl}",
-          file=sys.stderr)
+if len(raw) % lrecl != 0:
+    print(f"Warning: size {len(raw)} not aligned to LRECL={lrecl}", file=sys.stderr)
 
-hex_lines = []
+diag = []
 
-for rec_num, i in enumerate(range(0, len(data), lrecl), 1):
-    raw = data[i:i+lrecl]
+for idx, off in enumerate(range(0, len(raw), lrecl), 1):
+    rec = raw[off:off+lrecl]
 
-    # Decode cp037, replace any control/non-printable characters with '.'
-    decoded = raw.decode('cp037', errors='replace')
-    sanitised = ''.join(
+    text = rec.decode('cp037', errors='replace')
+    clean = ''.join(
         c if unicodedata.category(c)[0] not in ('C', 'Z') or c == ' '
         else '.'
-        for c in decoded
+        for c in text
     ).rstrip()
 
-    print(sanitised)
+    print(clean)
 
-    # --- Hex diagnostic ---
-    # For APF entry lines, break out the fields:
-    #   [0:25]  = "INFO: APF entry: dataset=" prefix (25 bytes)
-    #   [25:69] = dataset name field (44 bytes)
-    #   [69:74] = " vol=" (5 bytes)
-    #   [74:80] = volser (6 bytes)
-    if b'INFO: APF entry:' in raw[:30].decode('cp037', errors='replace').encode('utf-8', errors='replace') or \
-       'APF entry' in sanitised:
-        dsn_raw  = raw[25:69]
-        vol_raw  = raw[74:80]
-        dsn_hex  = dsn_raw.hex()
-        vol_hex  = vol_raw.hex()
-        dsn_valid = all(b in VALID_DSN_EBCDIC for b in dsn_raw)
-        hex_lines.append(
-            f"Record {rec_num}: DSN hex={dsn_hex}  VOL hex={vol_hex}  "
-            f"DSN_bytes_valid={'YES' if dsn_valid else 'NO — contains non-DSN EBCDIC bytes'}"
+    if "APF entry" in clean:
+        dsn = rec[25:69]
+        vol = rec[74:80]
+
+        valid = all(b in VALID for b in dsn)
+
+        diag.append(
+            f"Record {idx}: DSN={dsn.hex()} VOL={vol.hex()} "
+            f"VALID={'YES' if valid else 'NO (invalid bytes present)'}"
         )
 
-# Write hex diagnostic file
-pathlib.Path(hexout).write_text('\n'.join(hex_lines) + '\n')
-print(f"\n[Hex diagnostic written to {hexout}]", file=sys.stderr)
-PYEOF
+pathlib.Path(hex_file).write_text("\n".join(diag) + "\n")
+print(f"\n[hex output -> {hex_file}]", file=sys.stderr)
+PY
 }
 
-# upload ASM source
-echo "=== Uploading HLASM probe '$PROBE_NAME' as member '$MEMBER' ==="
-echo "=== Output dataset  : '$OUTPUT_DSN' ==="
-echo "=== Listing dataset : '$LISTING_DSN' ==="
+# --- Upload ASM ---
+echo "[Uploading] $PROBE -> $MEMBER"
+echo "[Output DSN] $OUT_DSN"
+echo "[Listing DSN] $LST_DSN"
 
-MAX_UPLOAD_ATTEMPTS=3
-UPLOAD_OK=0
-for upload_attempt in $(seq 1 $MAX_UPLOAD_ATTEMPTS); do
-  echo "Upload attempt $upload_attempt / $MAX_UPLOAD_ATTEMPTS..."
-  [ "$upload_attempt" -gt 1 ] && sleep 3
-  UPLOAD_RESPONSE=$(ftp -inv "$HOST" 2>&1 <<FTPEOF
+TRIES=3
+SUCCESS=0
+
+for n in $(seq 1 $TRIES); do
+  echo "Upload try $n/$TRIES"
+  [ "$n" -gt 1 ] && sleep 3
+
+  RESP=$(ftp -inv "$HOST" <<EOF 2>&1
 user $USER $PASS
 quote TYPE A
-put $PROBE_LOCAL "'$ASM_PDS($MEMBER)'"
+put $SRC_FILE "'$ASM_PDS($MEMBER)'"
 bye
-FTPEOF
+EOF
 )
-  echo "$UPLOAD_RESPONSE"
-  if upload_succeeded "$UPLOAD_RESPONSE"; then
-    UPLOAD_OK=1
+
+  echo "$RESP"
+
+  if upload_ok "$RESP"; then
+    SUCCESS=1
     break
   fi
-  echo "Upload attempt $upload_attempt failed, retrying..."
+
+  echo "Retrying..."
 done
 
-if [ "$UPLOAD_OK" -ne 1 ]; then
-  echo "ERROR: ASM upload failed after $MAX_UPLOAD_ATTEMPTS attempts."
+if [ "$SUCCESS" -ne 1 ]; then
+  echo "Upload failed after $TRIES attempts"
   exit 1
 fi
 
-# submit JCL
-echo "=== Submitting JCL ==="
+# --- Submit job ---
+echo "[Submitting JCL]"
 sleep 1
-SUBMIT_RESPONSE=$(ftp -inv "$HOST" 2>&1 <<FTPEOF
+
+RESP=$(ftp -inv "$HOST" <<EOF 2>&1
 user $USER $PASS
 quote TYPE A
 quote site filetype=jes
-put "$TMP_JCL_SUBST"
+put "$TMP_JCL_FILLED"
 bye
-FTPEOF
+EOF
 )
-echo "$SUBMIT_RESPONSE"
 
-JOBID=$(echo "$SUBMIT_RESPONSE" \
-  | grep -i "known to JES as" \
-  | grep -oE 'JOB[0-9]+' \
-  | head -1)
+echo "$RESP"
 
-if [ -z "$JOBID" ]; then
-  echo "ERROR: Could not extract JobID."
-  exit 1
-fi
-echo "JobID = $JOBID"
+JOBID=$(grep -oE 'JOB[0-9]+' <<<"$RESP" | head -1)
 
-# Poll for ASM listing (ASCII fine here — pure printer text, no raw storage bytes)
-echo "=== Polling for ASM listing '$LISTING_DSN' ==="
-MAX_ATTEMPTS=20
-SLEEP=5
+[ -z "$JOBID" ] && { echo "No JobID found"; exit 1; }
 
-for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-  echo "Listing attempt $attempt / $MAX_ATTEMPTS..."
-  rm -f "$LOCAL_LISTING"
-  ftp_get_ascii "$LISTING_DSN" "$LOCAL_LISTING" | grep -Ev "^(user|quote|bye|ftp>)" | tail -3
+echo "Job: $JOBID"
 
-  if [ -f "$LOCAL_LISTING" ] && [ -s "$LOCAL_LISTING" ]; then
-    echo "=== ASM listing saved to $LOCAL_LISTING ==="
-    cat "$LOCAL_LISTING"
-    echo "============================================"
-    ftp_delete_dataset "$LISTING_DSN"
+# --- Listing poll ---
+echo "[Waiting for listing]"
 
-    HLASM_RC=$(grep -m1 'Return Code' "$LOCAL_LISTING" 2>/dev/null \
-               | awk '{print $NF + 0}')
-    if [ "${HLASM_RC:-0}" -gt 4 ]; then
-      echo "ERROR: Assembly failed with Return Code ${HLASM_RC} — see listing above."
+MAX=20
+DELAY=5
+
+for i in $(seq 1 $MAX); do
+  echo "Listing check $i/$MAX"
+  rm -f "$LOCAL_LST"
+
+  ftp_ascii "$LST_DSN" "$LOCAL_LST" | tail -3
+
+  if [ -s "$LOCAL_LST" ]; then
+    echo "[Listing saved]"
+    cat "$LOCAL_LST"
+
+    ftp_remove "$LST_DSN"
+
+    RC=$(grep -m1 'Return Code' "$LOCAL_LST" | awk '{print $NF+0}')
+
+    if [ "${RC:-0}" -gt 4 ]; then
+      echo "Assembly error RC=$RC"
       exit 1
     fi
+
     break
   fi
 
-  echo "Not ready, sleeping ${SLEEP}s..."
-  sleep "$SLEEP"
+  sleep "$DELAY"
 done
 
-if [ ! -s "$LOCAL_LISTING" ]; then
-  echo "WARNING: ASM listing '$LISTING_DSN' never appeared after $((MAX_ATTEMPTS * SLEEP))s."
-fi
+# --- Output poll ---
+echo "[Waiting for output dataset]"
 
-# Poll for program output — binary transfer, decoded client-side
-echo "=== Polling for output dataset '$OUTPUT_DSN' ==="
+READY=0
 
-OUTPUT_READY=0
-for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-  echo "Attempt $attempt / $MAX_ATTEMPTS..."
-  rm -f "$LOCAL_OUTPUT_BIN"
+for i in $(seq 1 $MAX); do
+  echo "Check $i/$MAX"
+  rm -f "$BIN_OUT"
 
-  ftp_get_binary "$OUTPUT_DSN" "$LOCAL_OUTPUT_BIN" \
-    | grep -Ev "^(user|quote|bye|ftp>)" | tail -3
+  ftp_binary "$OUT_DSN" "$BIN_OUT" | tail -3
 
-  if [ -f "$LOCAL_OUTPUT_BIN" ] && [ -s "$LOCAL_OUTPUT_BIN" ]; then
-    echo "=== Binary output saved to $LOCAL_OUTPUT_BIN ==="
-    ftp_delete_dataset "$OUTPUT_DSN"
-    OUTPUT_READY=1
+  if [ -s "$BIN_OUT" ]; then
+    ftp_remove "$OUT_DSN"
+    READY=1
     break
   fi
 
-  echo "Not ready, sleeping ${SLEEP}s..."
-  sleep "$SLEEP"
+  sleep "$DELAY"
 done
 
-if [ "$OUTPUT_READY" -ne 1 ]; then
-  echo "ERROR: Timed out after $((MAX_ATTEMPTS * SLEEP))s — '$OUTPUT_DSN' never appeared."
-  echo "       Check listing above for assembly/link errors."
+if [ "$READY" -ne 1 ]; then
+  echo "Timeout waiting for dataset $OUT_DSN"
   exit 1
 fi
 
-echo "=== Probe output ==="
-decode_ebcdic_output "$LOCAL_OUTPUT_BIN" "$LOCAL_OUTPUT_HEX" 133 | tee "$LOCAL_OUTPUT"
+# --- Decode ---
+echo "[Decoded output]"
+decode_data "$BIN_OUT" "$HEX_OUT" 133 | tee "$LOCAL_TXT"
 
 echo ""
-echo "=== Hex diagnostic (raw EBCDIC bytes per field) ==="
-cat "$LOCAL_OUTPUT_HEX"
+echo "[Hex diagnostics]"
+cat "$HEX_OUT"
+
 echo ""
-echo "If DSN bytes are marked 'NO', CVTAPF is not pointing to a standard"
-echo "APF table. Check SYS1.PARMLIB(IEAAPFxx) and CVTAPF value in storage."
-echo "=== Done ==="
+echo "If DSN validity shows NO, your APF source is likely non-standard."
+echo "[Done]"
