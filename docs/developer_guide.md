@@ -75,53 +75,35 @@ Create `crates/msas_scanners/src/my_scanner.rs`:
 
 ```rust
 use msas_core::{Config, MsasError, Findings, Severity};
-use std::fs;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::{env, fs, path::{Path, PathBuf}, process::{Command, Stdio}};
 
 pub fn scan_my_scanner_with_config(config: &Config) -> Result<Vec<Findings>, MsasError> {
-    internal_scan(Some(config))
+    run_scan(config.clone())
 }
 
 pub fn scan_my_scanner() -> Result<Vec<Findings>, MsasError> {
-    internal_scan(None)
+    run_scan(Config::default()?)
 }
 
-fn internal_scan(config_opt: Option<&Config>) -> Result<Vec<Findings>, MsasError> {
-    let config = match config_opt {
-        Some(c) => c.clone(),
-        None => Config::default()?,
-    };
+fn run_scan(config: Config) -> Result<Vec<Findings>, MsasError> {
+    let root = workspace_root()?;
+    let script = root.join("scripts/run_rexx.sh");
 
-    // Resolve workspace root from CARGO_MANIFEST_DIR
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .map_err(|_| MsasError::Other("CARGO_MANIFEST_DIR not set".into()))?;
-    let workspace_root = Path::new(&manifest_dir)
-        .parent().and_then(|p| p.parent())
-        .ok_or_else(|| MsasError::Other("Could not determine workspace root".into()))?
-        .to_path_buf();
-
-    let script_path = workspace_root.join("scripts").join("run_demo.sh");
-    if !script_path.exists() {
-        return Err(MsasError::Other(format!("Script not found: {:?}", script_path)));
+    if !script.exists() {
+        return Err(MsasError::Other(format!("Script not found: {:?}", script)));
     }
 
-    // Unique output file per invocation — avoids parallel test collisions
-    let local_output = {
-        let base = Path::new(&config.paths.local_output);
-        let dir = base.parent().unwrap_or(Path::new("test_output"));
-        format!("{}/my_scanner_{}.txt", dir.display(), std::process::id())
-    };
+    let output_path = build_output_path(&config);
 
-    let status = Command::new(&script_path)
-        .current_dir(&workspace_root)
-        .arg("my_probe_name")           // must match a .rex file in probes/rexx/
-        .env("MF_HOST",     &config.mainframe.host)
-        .env("MF_USER",     &config.mainframe.user)
-        .env("MF_PASS",     &config.mainframe.password)
-        .env("REXX_PDS",    &config.paths.rexx_pds)
-        .env("OUTPUT_DSN",  &config.paths.output_dataset)
-        .env("LOCAL_OUTPUT",&local_output)
+    let status = Command::new(&script)
+        .current_dir(&root)
+        .arg("my_probe_name")
+        .env("MF_HOST", &config.mainframe.host)
+        .env("MF_USER", &config.mainframe.user)
+        .env("MF_PASS", &config.mainframe.password)
+        .env("REXX_PDS", &config.paths.rexx_pds)
+        .env("OUTPUT_DSN", &config.paths.output_dataset)
+        .env("LOCAL_OUTPUT", &output_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -131,40 +113,61 @@ fn internal_scan(config_opt: Option<&Config>) -> Result<Vec<Findings>, MsasError
         return Err(MsasError::ScriptFailed(format!("Script exited with: {}", status)));
     }
 
-    let contents = fs::read_to_string(&local_output)?;
+    let contents = fs::read_to_string(&output_path)?;
     parse_output(&contents)
 }
 
+fn workspace_root() -> Result<PathBuf, MsasError> {
+    let dir = env::var("CARGO_MANIFEST_DIR")
+        .map_err(|_| MsasError::Other("CARGO_MANIFEST_DIR not set".into()))?;
+
+    Path::new(&dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| MsasError::Other("Could not determine workspace root".into()))
+}
+
+fn build_output_path(config: &Config) -> String {
+    let base = Path::new(&config.paths.local_output);
+    let dir = base.parent().unwrap_or(Path::new("test_output"));
+    format!("{}/my_scanner_{}.txt", dir.display(), std::process::id())
+}
+
 pub fn parse_output(contents: &str) -> Result<Vec<Findings>, MsasError> {
-    let mut findings = Vec::new();
+    let mut results = Vec::new();
 
-    for line in contents.lines() {
-        let trimmed = line.trim();
-
-        let (severity, rest) = if let Some(r) = trimmed.strip_prefix("WARNING:") {
-            (Severity::High, r.trim())
-        } else if let Some(r) = trimmed.strip_prefix("INSECURE:") {
-            (Severity::Critical, r.trim())
-        } else if let Some(r) = trimmed.strip_prefix("INFO:") {
-            (Severity::Info, r.trim())
-        } else {
-            continue;
-        };
-
-        let affected = rest.split_whitespace().next()
-            .unwrap_or("unknown").to_string();
-
-        findings.push(Findings {
-            id:                "MY-FINDING-ID".to_string(),
-            title:             trimmed.to_string(),
-            severity,
-            affected_resource: affected,
-            remediation:       "Describe the fix here".to_string(),
-            compliance:        None,
-        });
+    for line in contents.lines().map(str::trim) {
+        let parsed = parse_line(line);
+        if let Some((severity, resource)) = parsed {
+            results.push(Findings {
+                id: "MY-FINDING-ID".to_string(),
+                title: line.to_string(),
+                severity,
+                affected_resource: resource,
+                remediation: "Describe the fix here".to_string(),
+                compliance: None,
+            });
+        }
     }
 
-    Ok(findings)
+    Ok(results)
+}
+
+fn parse_line(line: &str) -> Option<(Severity, String)> {
+    let (severity, rest) = if let Some(r) = line.strip_prefix("WARNING:") {
+        (Severity::High, r)
+    } else if let Some(r) = line.strip_prefix("INSECURE:") {
+        (Severity::Critical, r)
+    } else if let Some(r) = line.strip_prefix("INFO:") {
+        (Severity::Info, r)
+    } else {
+        return None;
+    };
+
+    let resource = rest.trim().split_whitespace().next().unwrap_or("unknown");
+
+    Some((severity, resource.to_string()))
 }
 ```
 
@@ -257,7 +260,7 @@ use std::io::Write;
 pub fn write_myformat_report<W: Write>(
     findings: &[Findings],
     mut writer: W,
-) -> Result<(), Box<dyn std::error::MsasError>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     // your implementation here
     Ok(())
 }
@@ -333,9 +336,9 @@ pub enum MsasError {
 }
 ```
 
-Scanner functions return `Result<Vec<Findings>, MsasError>`. The CLI uses `anyhow` to wrap these for user-friendly error messages. Reporters return `Result<(), Box<dyn std::error::MsasError>>` since they use third-party crates with their own error types.
+Scanner functions return `Result<Vec<Findings>, MsasError>`. The CLI uses `anyhow` to wrap these for user-friendly error messages. Reporters return `Result<(), Box<dyn std::error::Error>>` since they use third-party crates with their own error types.
 
-If you add a scanner, use `MsasError::ScriptFailed` for non-zero exit codes, `MsasError::Io` (via `From<std::io::MsasError>`) for file operations, and `MsasError::Parse` for anything that goes wrong while interpreting probe output.
+If you add a scanner, use `MsasError::ScriptFailed` for non-zero exit codes, `MsasError::Io` (via `From<std::io::Error>`) for file operations, and `MsasError::Parse` for anything that goes wrong while interpreting probe output.
 
 ---
 
@@ -379,7 +382,7 @@ All config and path resolution uses `CARGO_MANIFEST_DIR`. When running `./target
 
 **MVS member name truncation**
 
-`run_rexx.sh` derives the member name from the probe argument by uppercasing, stripping `_` and `-`, and taking the first 8 characters. `my_long_probe_name` becomes `MYLONGPR`. If two probes produce the same 8-character prefix, they'll overwrite each other in the PDS. Keep probe names short and unique.
+`run_rexx.sh` derives the member name from the probe argument by uppercasing, stripping `_` and `-`, and taking the first 8 characters. `my_long_probe_name` becomes `MYLONGPR`. Note that if two probes produce the same 8-character prefix, they'll overwrite each other in the PDS. The caller is advised to keep probe names short and unique.
 
 **FTP `EXCLUSIVE use` / `SPFEDIT` lock**
 
