@@ -54,7 +54,7 @@ The full documentation suite lives alongside this file:
 | ------------------ | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | DEVELOPER_GUIDE.md | If you want to extend the codebase | How to add a new scanner, probe, or report format; the config system; error handling conventions; and common pitfalls |
 
-If you're here for the first time, start with the README (it's this text), then DEVELOPER_GUIDE.md when you want to understand how it works.
+If you're here for the first time, start with the README (it's this text), then [DEVELOPER_GUIDE](docs/developer_guide.md) when you want to understand how it works.
 
 ---
 
@@ -285,4 +285,4 @@ If you're looking to add a new scanner, probe, or report format, see **DEVELOPER
 
 ## Security Notes
 
-Since this targets a local Hercules setup, the defaults (plain FTP, `IBMUSER`/`SYS1`) are perfectly fine for experimentation. In practice, use `MAINFRAME_PASSWORD` instead of hardcoding credentials, restrict FTP to internal networks, and use a dedicated low-privilege auditing account rather than a superuser ID.
+Since this targets a local Hercules setup, the defaults (plain FTP, `IBMUSER`/`SYS1`) are perfectly fine for experimentation. In practice, use `MAINFRAME_PASSWORD` instead of hardcoding credentials, restrict FTP to internal networks, and use a dedicated low-privilege auditing account rather than a superuser ID. Thank you for reading!
